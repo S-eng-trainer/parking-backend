@@ -1,4 +1,4 @@
-name: Deploy Gradle App to EC2
+name: CD - Deploy Spring Boot to AWS EC2
 
 on:
   push:
@@ -6,34 +6,26 @@ on:
 
 jobs:
   deploy:
+    name: Build and Deploy
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+          cache: 'gradle'
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build JAR (clean)
+      - name: Build JAR
         run: ./gradlew clean bootJar --no-daemon
 
-      - name: Upload artifact
+      - name: Upload Artifact (Debug)
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
@@ -45,107 +37,57 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_SSH_USER || 'ec2-user' }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: build/libs/*.jar
-          target: /home/${{ secrets.EC2_SSH_USER || 'ec2-user' }}/app/
+          source: "build/libs/*.jar"
+          target: "/home/${{ secrets.EC2_SSH_USER || 'ec2-user' }}/app"
+          strip_components: 2 # Elimina 'build/libs' para que el JAR quede en /app/
 
-      - name: Remote deploy and start
+      - name: Remote Deploy and Start
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_SSH_USER || 'ec2-user' }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            set -euo pipefail
-            APP_DIR=/home/${{ secrets.EC2_SSH_USER || 'ec2-user' }}/app
-            mkdir -p "$APP_DIR"
-            # Move uploaded jar to a stable name for atomic replacement
-            # Support two possible locations: $APP_DIR/*.jar or $APP_DIR/build/libs/*.jar
-            JAR_FILE=$(ls -1t "$APP_DIR"/*.jar "$APP_DIR"/build/libs/*.jar 2>/dev/null | head -n1 || true)
-            if [ -z "$JAR_FILE" ]; then
-              echo "No jar found in $APP_DIR or $APP_DIR/build/libs" >&2
+            set -e
+            APP_DIR="/home/${{ secrets.EC2_SSH_USER || 'ec2-user' }}/app"
+            cd "$APP_DIR"
+
+            # 1. Identificar el nuevo JAR y estandarizar nombre
+            NEW_JAR=$(ls -t build/libs/*.jar 2>/dev/null | head -n1 || ls -t *.jar 2>/dev/null | head -n1)
+            
+            if [ -z "$NEW_JAR" ]; then
+              echo "FATAL: No se encontró ningún archivo JAR."
               exit 1
             fi
-            mv "$JAR_FILE" "$APP_DIR/app.jar"
-            chmod +x "$APP_DIR/app.jar"
 
-            # Prefer pidfile-based shutdown if present to avoid killing unrelated java processes
-            PID_FILE="$APP_DIR/app.pid"
-            if [ -f "$PID_FILE" ]; then
-              OLD_PID=$(cat "$PID_FILE" || true)
-              if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
-                echo "Stopping existing app process pid=$OLD_PID"
-                kill -TERM "$OLD_PID" || true
-                for j in $(seq 1 20); do
-                  if ! kill -0 "$OLD_PID" >/dev/null 2>&1; then
-                    break
-                  fi
-                  sleep 1
-                done
-                if kill -0 "$OLD_PID" >/dev/null 2>&1; then
-                  echo "Process $OLD_PID still running after TERM, sending KILL"
-                  kill -KILL "$OLD_PID" || true
-                fi
-              else
-                echo "PID file exists but process not found, falling back to pattern kill"
-                rm -f "$PID_FILE" || true
-              fi
-            else
-              if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
-                echo "Stopping existing app processes by pattern"
-                pkill -TERM -f '/app/app.jar' || true
-                for j in $(seq 1 15); do
-                  if ! pgrep -f '/app/app.jar' >/dev/null 2>&1; then
-                    break
-                  fi
-                  sleep 1
-                done
-                if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
-                  echo "Processes still running after TERM, sending KILL"
-                  pkill -KILL -f '/app/app.jar' || true
-                fi
-              fi
-            fi
+            echo "Instalando nuevo artefacto: $NEW_JAR"
+            mv "$NEW_JAR" app.jar
 
-            # Start the app in background and redirect logs. Record PID.
-            echo "Starting new app"
-            nohup java -jar "$APP_DIR/app.jar" \
+            # 2. Detener proceso anterior de forma segura
+            echo "Deteniendo procesos previos en puerto 8080..."
+            sudo fuser -k 8080/tcp || true
+            sleep 2
+
+            # 3. Iniciar aplicación con perfil externo
+            echo "Iniciando Spring Boot con perfil de producción..."
+            nohup java -jar app.jar \
               --spring.config.location=file:$APP_DIR/application-prod.properties \
-              > "$APP_DIR/app.log" 2>&1 &
+              > app.log 2>&1 &
+            
             NEW_PID=$!
-            echo $NEW_PID > "$APP_DIR/app.pid"
-            echo "Started PID=$NEW_PID"
+            echo "App lanzada con PID: $NEW_PID"
 
-            # Short wait to ensure process didn't immediately exit with TERM (exit 143)
-            sleep 3
-            if ! kill -0 "$NEW_PID" >/dev/null 2>&1; then
-              echo "Process died quickly after start. Recent logs:"
-              tail -n 200 "$APP_DIR/app.log" || true
-              # scan for TERM/143 evidence
-              if grep -Eiq "SIGTERM|exit code 143|status 143" "$APP_DIR/app.log"; then
-                echo "Detected SIGTERM/exit 143 in logs"
-              fi
-              exit 1
-            fi
-
-            # Wait for the app to be healthy (tries root URL) and ensure PID stays alive
-            for i in $(seq 1 30); do
-              sleep 2
-              if ! kill -0 "$NEW_PID" >/dev/null 2>&1; then
-                echo "Application process $NEW_PID exited during startup. Last logs:" >&2
-                tail -n 200 "$APP_DIR/app.log" || true
-                if grep -Eiq "SIGTERM|exit code 143|status 143" "$APP_DIR/app.log"; then
-                  echo "Detected SIGTERM/exit 143 in logs" >&2
-                fi
-                exit 1
-              fi
-              # Prefer the health endpoint and check returned JSON contains "UP"
-              if curl -fsS http://127.0.0.1:8080/health 2>/dev/null | grep -Eiq '"status"\s*:\s*"?UP"?'; then
-                echo "Application is up (pid=$NEW_PID)"
+            # 4. Verificación de salud (Timeout 60s)
+            echo "Esperando a que la aplicación responda..."
+            for i in {1..12}; do
+              if curl -s localhost:8080 > /dev/null; then
+                echo "¡Despliegue exitoso! La aplicación responde."
                 exit 0
               fi
+              echo "Reintentando salud ($i/12)..."
+              sleep 5
             done
-            echo "Application did not become healthy within timeout" >&2
-            echo "Tail of application log:" >&2
-            tail -n 200 "$APP_DIR/app.log" || true
+
+            echo "ERROR: La aplicación no inició a tiempo. Revisa app.log"
+            tail -n 50 app.log
             exit 1
-  
