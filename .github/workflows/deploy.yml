@@ -69,22 +69,62 @@ jobs:
             chmod +x "$APP_DIR/app.jar"
 
             # Stop any existing java process started from app.jar (best-effort)
-            pkill -f '/app/app.jar' || true
+            if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
+              echo "Stopping existing app processes"
+              pkill -TERM -f '/app/app.jar' || true
+              # wait for processes to disappear
+              for j in $(seq 1 15); do
+                if ! pgrep -f '/app/app.jar' >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 1
+              done
+              # if still running, escalate
+              if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
+                echo "Processes still running after TERM, sending KILL"
+                pkill -KILL -f '/app/app.jar' || true
+              fi
+            fi
 
-            # Start the app in background and redirect logs
+            # Start the app in background and redirect logs. Record PID.
+            echo "Starting new app"
             nohup java -jar "$APP_DIR/app.jar" \
               --spring.config.location=file:$APP_DIR/application-prod.properties \
               > "$APP_DIR/app.log" 2>&1 &
+            NEW_PID=$!
+            echo $NEW_PID > "$APP_DIR/app.pid"
+            echo "Started PID=$NEW_PID"
 
-            # Wait for the app to be healthy (tries root URL)
+            # Short wait to ensure process didn't immediately exit with TERM (exit 143)
+            sleep 3
+            if ! kill -0 "$NEW_PID" >/dev/null 2>&1; then
+              echo "Process died quickly after start. Recent logs:"
+              tail -n 200 "$APP_DIR/app.log" || true
+              # scan for TERM/143 evidence
+              if grep -Eiq "SIGTERM|exit code 143|status 143" "$APP_DIR/app.log"; then
+                echo "Detected SIGTERM/exit 143 in logs"
+              fi
+              exit 1
+            fi
+
+            # Wait for the app to be healthy (tries root URL) and ensure PID stays alive
             for i in $(seq 1 30); do
               sleep 2
+              if ! kill -0 "$NEW_PID" >/dev/null 2>&1; then
+                echo "Application process $NEW_PID exited during startup. Last logs:" >&2
+                tail -n 200 "$APP_DIR/app.log" || true
+                if grep -Eiq "SIGTERM|exit code 143|status 143" "$APP_DIR/app.log"; then
+                  echo "Detected SIGTERM/exit 143 in logs" >&2
+                fi
+                exit 1
+              fi
               if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
-                echo "Application is up"
+                echo "Application is up (pid=$NEW_PID)"
                 exit 0
               fi
             done
-            echo "Application did not start within timeout" >&2
+            echo "Application did not become healthy within timeout" >&2
+            echo "Tail of application log:" >&2
             tail -n 200 "$APP_DIR/app.log" || true
             exit 1
   
