@@ -19,12 +19,10 @@ jobs:
       # 1. Dar permisos de ejecución al wrapper de Gradle
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
-        working-directory: ./parking-backend # <--- CAMBIA ESTO SI ES OTRA CARPETA
 
       # 2. Construir el JAR usando Gradle
       - name: Build with Gradle
         run: ./gradlew bootJar
-        working-directory: ./parking-backend # <--- MISMA CARPETA
 
       # 3. Copiar el JAR a la EC2
       - name: Copy JAR to EC2
