@@ -59,9 +59,10 @@ jobs:
             APP_DIR=/home/${{ secrets.EC2_SSH_USER || 'ec2-user' }}/app
             mkdir -p "$APP_DIR"
             # Move uploaded jar to a stable name for atomic replacement
-            JAR_FILE=$(ls -1t "$APP_DIR"/*.jar | head -n1)
+            # Support two possible locations: $APP_DIR/*.jar or $APP_DIR/build/libs/*.jar
+            JAR_FILE=$(ls -1t "$APP_DIR"/*.jar "$APP_DIR"/build/libs/*.jar 2>/dev/null | head -n1 || true)
             if [ -z "$JAR_FILE" ]; then
-              echo "No jar found in $APP_DIR" >&2
+              echo "No jar found in $APP_DIR or $APP_DIR/build/libs" >&2
               exit 1
             fi
             mv "$JAR_FILE" "$APP_DIR/app.jar"
