@@ -53,15 +53,36 @@ jobs:
             cd "$APP_DIR"
 
             # 1. Identificar el nuevo JAR y estandarizar nombre
-            NEW_JAR=$(ls -t build/libs/*.jar 2>/dev/null | head -n1 || ls -t *.jar 2>/dev/null | head -n1)
-            
+            echo "Contenido de $APP_DIR:" 
+            ls -la || true
+            echo "Contenido de $APP_DIR/build/libs (si existe):"
+            ls -la build/libs 2>/dev/null || true
+
+            # Prefer the explicitly copied jar in $APP_DIR, then build/libs
+            NEW_JAR=""
+            if ls -1t *.jar 1>/dev/null 2>&1; then
+              NEW_JAR=$(ls -1t *.jar | head -n1)
+            fi
+            if [ -z "$NEW_JAR" ] && ls -1t build/libs/*.jar 1>/dev/null 2>&1; then
+              NEW_JAR=$(ls -1t build/libs/*.jar | head -n1)
+            fi
+
+            # Fallback: search recursively for the most recent jar under APP_DIR
             if [ -z "$NEW_JAR" ]; then
-              echo "FATAL: No se encontró ningún archivo JAR."
+              NEW_JAR=$(find . -type f -name "*.jar" -printf "%T@ %p\n" 2>/dev/null | sort -n -r | head -n1 | awk '{print $2}' || true)
+            fi
+
+            if [ -z "$NEW_JAR" ]; then
+              echo "FATAL: No se encontró ningún archivo JAR en $APP_DIR ni en build/libs."
               exit 1
             fi
 
             echo "Instalando nuevo artefacto: $NEW_JAR"
-            mv "$NEW_JAR" app.jar
+            # Move to incoming name first to avoid races with old discovery
+            mv "$NEW_JAR" app-incoming.jar
+            chmod 644 app-incoming.jar
+            # Atomic replace
+            mv -f app-incoming.jar app.jar
 
             # 2. Detener proceso anterior de forma segura
             echo "Deteniendo procesos previos en puerto 8080..."
