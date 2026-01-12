@@ -68,21 +68,41 @@ jobs:
             mv "$JAR_FILE" "$APP_DIR/app.jar"
             chmod +x "$APP_DIR/app.jar"
 
-            # Stop any existing java process started from app.jar (best-effort)
-            if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
-              echo "Stopping existing app processes"
-              pkill -TERM -f '/app/app.jar' || true
-              # wait for processes to disappear
-              for j in $(seq 1 15); do
-                if ! pgrep -f '/app/app.jar' >/dev/null 2>&1; then
-                  break
+            # Prefer pidfile-based shutdown if present to avoid killing unrelated java processes
+            PID_FILE="$APP_DIR/app.pid"
+            if [ -f "$PID_FILE" ]; then
+              OLD_PID=$(cat "$PID_FILE" || true)
+              if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
+                echo "Stopping existing app process pid=$OLD_PID"
+                kill -TERM "$OLD_PID" || true
+                for j in $(seq 1 20); do
+                  if ! kill -0 "$OLD_PID" >/dev/null 2>&1; then
+                    break
+                  fi
+                  sleep 1
+                done
+                if kill -0 "$OLD_PID" >/dev/null 2>&1; then
+                  echo "Process $OLD_PID still running after TERM, sending KILL"
+                  kill -KILL "$OLD_PID" || true
                 fi
-                sleep 1
-              done
-              # if still running, escalate
+              else
+                echo "PID file exists but process not found, falling back to pattern kill"
+                rm -f "$PID_FILE" || true
+              fi
+            else
               if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
-                echo "Processes still running after TERM, sending KILL"
-                pkill -KILL -f '/app/app.jar' || true
+                echo "Stopping existing app processes by pattern"
+                pkill -TERM -f '/app/app.jar' || true
+                for j in $(seq 1 15); do
+                  if ! pgrep -f '/app/app.jar' >/dev/null 2>&1; then
+                    break
+                  fi
+                  sleep 1
+                done
+                if pgrep -f '/app/app.jar' >/dev/null 2>&1; then
+                  echo "Processes still running after TERM, sending KILL"
+                  pkill -KILL -f '/app/app.jar' || true
+                fi
               fi
             fi
 
@@ -118,7 +138,8 @@ jobs:
                 fi
                 exit 1
               fi
-              if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              # Prefer the health endpoint and check returned JSON contains "UP"
+              if curl -fsS http://127.0.0.1:8080/health 2>/dev/null | grep -Eiq '"status"\s*:\s*"?UP"?'; then
                 echo "Application is up (pid=$NEW_PID)"
                 exit 0
               fi
